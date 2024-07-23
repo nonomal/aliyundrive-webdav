@@ -15,9 +15,9 @@ use dav_server::{
         ReadDirMeta,
     },
 };
-use futures_util::future::FutureExt;
+use futures_util::future::{ready, FutureExt};
 use path_slash::PathBufExt;
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 use zip::write::{FileOptions, ZipWriter};
 
 use crate::{
@@ -35,20 +35,12 @@ pub struct AliyunDriveFileSystem {
     read_only: bool,
     upload_buffer_size: usize,
     skip_upload_same_size: bool,
+    prefer_http_download: bool,
 }
 
 impl AliyunDriveFileSystem {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        drive: AliyunDrive,
-        root: String,
-        cache_size: u64,
-        cache_ttl: u64,
-        no_trash: bool,
-        read_only: bool,
-        upload_buffer_size: usize,
-        skip_upload_same_size: bool,
-    ) -> Result<Self> {
+    pub fn new(drive: AliyunDrive, root: String, cache_size: u64, cache_ttl: u64) -> Result<Self> {
         let dir_cache = Cache::new(cache_size, cache_ttl);
         debug!("dir cache initialized");
         let root = if root.starts_with('/') {
@@ -61,11 +53,37 @@ impl AliyunDriveFileSystem {
             dir_cache,
             uploading: Arc::new(DashMap::new()),
             root,
-            no_trash,
-            read_only,
-            upload_buffer_size,
-            skip_upload_same_size,
+            no_trash: false,
+            read_only: false,
+            upload_buffer_size: 16 * 1024 * 1024,
+            skip_upload_same_size: false,
+            prefer_http_download: false,
         })
+    }
+
+    pub fn set_read_only(&mut self, read_only: bool) -> &mut Self {
+        self.read_only = read_only;
+        self
+    }
+
+    pub fn set_no_trash(&mut self, no_trash: bool) -> &mut Self {
+        self.no_trash = no_trash;
+        self
+    }
+
+    pub fn set_upload_buffer_size(&mut self, upload_buffer_size: usize) -> &mut Self {
+        self.upload_buffer_size = upload_buffer_size;
+        self
+    }
+
+    pub fn set_skip_upload_same_size(&mut self, skip_upload_same_size: bool) -> &mut Self {
+        self.skip_upload_same_size = skip_upload_same_size;
+        self
+    }
+
+    pub fn set_prefer_http_download(&mut self, prefer_http_download: bool) -> &mut Self {
+        self.prefer_http_download = prefer_http_download;
+        self
     }
 
     fn find_in_cache(&self, path: &Path) -> Result<Option<AliyunFile>, FsError> {
@@ -238,7 +256,18 @@ impl DavFileSystem for AliyunDriveFileSystem {
                 .get_file(parent_path.to_path_buf())
                 .await?
                 .ok_or(FsError::NotFound)?;
-            let dav_file = if let Some(file) = self.get_file(path.clone()).await? {
+            let sha1 = options.checksum.and_then(|c| {
+                if let Some((algo, hash)) = c.split_once(':') {
+                    if algo.eq_ignore_ascii_case("sha1") {
+                        Some(hash.to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+            let mut dav_file = if let Some(file) = self.get_file(path.clone()).await? {
                 if options.write && options.create_new {
                     return Err(FsError::Exists);
                 }
@@ -249,7 +278,9 @@ impl DavFileSystem for AliyunDriveFileSystem {
                     self.clone(),
                     file,
                     parent_file.id,
+                    parent_path.to_path_buf(),
                     options.size.unwrap_or_default(),
+                    sha1,
                 )
             } else if options.write && (options.create || options.create_new) {
                 if self.read_only {
@@ -276,13 +307,22 @@ impl DavFileSystem for AliyunDriveFileSystem {
                     updated_at: DateTime::new(now),
                     size: size.unwrap_or(0),
                     url: None,
+                    content_hash: None,
                 };
                 let mut uploading = self.uploading.entry(parent_file.id.clone()).or_default();
                 uploading.push(file.clone());
-                AliyunDavFile::new(self.clone(), file, parent_file.id, size.unwrap_or(0))
+                AliyunDavFile::new(
+                    self.clone(),
+                    file,
+                    parent_file.id,
+                    parent_path.to_path_buf(),
+                    size.unwrap_or(0),
+                    sha1,
+                )
             } else {
                 return Err(FsError::NotFound);
             };
+            dav_file.http_download = self.prefer_http_download;
             Ok(Box::new(dav_file) as Box<dyn DavFile>)
         }
         .boxed()
@@ -373,6 +413,7 @@ impl DavFileSystem for AliyunDriveFileSystem {
                     error!(path = %path.display(), error = %err, "remove directory failed");
                     FsError::GeneralFailure
                 })?;
+            self.dir_cache.invalidate(&path).await;
             self.dir_cache.invalidate_parent(&path).await;
             Ok(())
         }
@@ -424,16 +465,15 @@ impl DavFileSystem for AliyunDriveFileSystem {
                 .get_file(to.parent().unwrap().to_path_buf())
                 .await?
                 .ok_or(FsError::NotFound)?;
-            let new_name = to_dav.file_name();
             self.drive
-                .copy_file(&file.id, &to_parent_file.id, new_name)
+                .copy_file(&file.id, &to_parent_file.id)
                 .await
                 .map_err(|err| {
                     error!(from = %from.display(), to = %to.display(), error = %err, "copy file failed");
                     FsError::GeneralFailure
                 })?;
 
-            self.dir_cache.invalidate_parent(&from).await;
+            self.dir_cache.invalidate(&to).await;
             self.dir_cache.invalidate_parent(&to).await;
             Ok(())
         }
@@ -449,6 +489,7 @@ impl DavFileSystem for AliyunDriveFileSystem {
                 return Err(FsError::Forbidden);
             }
 
+            let is_dir;
             if from.parent() == to.parent() {
                 // rename
                 if let Some(name) = to.file_name() {
@@ -456,6 +497,7 @@ impl DavFileSystem for AliyunDriveFileSystem {
                         .get_file(from.clone())
                         .await?
                         .ok_or(FsError::NotFound)?;
+                    is_dir = matches!(file.r#type, FileType::Folder);
                     let name = name.to_string_lossy().into_owned();
                     self.drive
                         .rename_file(&file.id, &name)
@@ -473,6 +515,7 @@ impl DavFileSystem for AliyunDriveFileSystem {
                     .get_file(from.clone())
                     .await?
                     .ok_or(FsError::NotFound)?;
+                is_dir = matches!(file.r#type, FileType::Folder);
                 let to_parent_file = self
                     .get_file(to.parent().unwrap().to_path_buf())
                     .await?
@@ -487,6 +530,9 @@ impl DavFileSystem for AliyunDriveFileSystem {
                     })?;
             }
 
+            if is_dir {
+                self.dir_cache.invalidate(&from).await;
+            }
             self.dir_cache.invalidate_parent(&from).await;
             self.dir_cache.invalidate_parent(&to).await;
             Ok(())
@@ -505,6 +551,42 @@ impl DavFileSystem for AliyunDriveFileSystem {
         }
         .boxed()
     }
+
+    fn have_props<'a>(
+        &'a self,
+        _path: &'a DavPath,
+    ) -> std::pin::Pin<Box<dyn futures_util::Future<Output = bool> + Send + 'a>> {
+        Box::pin(ready(true))
+    }
+
+    fn get_prop(&self, dav_path: &DavPath, prop: dav_server::fs::DavProp) -> FsFuture<Vec<u8>> {
+        let path = self.normalize_dav_path(dav_path);
+        let prop_name = match prop.prefix.as_ref() {
+            Some(prefix) => format!("{}:{}", prefix, prop.name),
+            None => prop.name.to_string(),
+        };
+        debug!(path = %path.display(), prop = %prop_name, "fs: get_prop");
+        async move {
+            if prop.namespace.as_deref() == Some("http://owncloud.org/ns")
+                && prop.name == "checksums"
+            {
+                let file = self.get_file(path).await?.ok_or(FsError::NotFound)?;
+                if let Some(sha1) = file.content_hash {
+                    let xml = format!(
+                        r#"<?xml version="1.0"?>
+                        <oc:checksums xmlns:d="DAV:" xmlns:nc="http://nextcloud.org/ns" xmlns:oc="http://owncloud.org/ns">
+                            <oc:checksum>sha1:{}</oc:checksum>
+                        </oc:checksums>
+                    "#,
+                        sha1
+                    );
+                    return Ok(xml.into_bytes());
+                }
+            }
+            Err(FsError::NotImplemented)
+        }
+        .boxed()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -515,6 +597,7 @@ struct UploadState {
     chunk: u64,
     upload_id: String,
     upload_urls: Vec<String>,
+    sha1: Option<String>,
 }
 
 impl Default for UploadState {
@@ -526,17 +609,19 @@ impl Default for UploadState {
             chunk: 1,
             upload_id: String::new(),
             upload_urls: Vec::new(),
+            sha1: None,
         }
     }
 }
 
-#[derive(Clone)]
 struct AliyunDavFile {
     fs: AliyunDriveFileSystem,
     file: AliyunFile,
     parent_file_id: String,
+    parent_dir: PathBuf,
     current_pos: u64,
     upload_state: UploadState,
+    http_download: bool,
 }
 
 impl Debug for AliyunDavFile {
@@ -551,16 +636,26 @@ impl Debug for AliyunDavFile {
 }
 
 impl AliyunDavFile {
-    fn new(fs: AliyunDriveFileSystem, file: AliyunFile, parent_file_id: String, size: u64) -> Self {
+    fn new(
+        fs: AliyunDriveFileSystem,
+        file: AliyunFile,
+        parent_file_id: String,
+        parent_dir: PathBuf,
+        size: u64,
+        sha1: Option<String>,
+    ) -> Self {
         Self {
             fs,
             file,
             parent_file_id,
+            parent_dir,
             current_pos: 0,
             upload_state: UploadState {
                 size,
+                sha1,
                 ..Default::default()
             },
+            http_download: false,
         }
     }
 
@@ -576,6 +671,14 @@ impl AliyunDavFile {
             let size = self.upload_state.size;
             debug!(file_name = %self.file.name, size = size, "prepare for upload");
             if !self.file.id.is_empty() {
+                if let Some(content_hash) = self.file.content_hash.as_ref() {
+                    if let Some(sha1) = self.upload_state.sha1.as_ref() {
+                        if content_hash.eq_ignore_ascii_case(sha1) {
+                            debug!(file_name = %self.file.name, sha1 = %sha1, "skip uploading same content hash file");
+                            return Ok(false);
+                        }
+                    }
+                }
                 if self.fs.skip_upload_same_size && self.file.size == size {
                     debug!(file_name = %self.file.name, size = size, "skip uploading same size file");
                     return Ok(false);
@@ -605,7 +708,11 @@ impl AliyunDavFile {
                     FsError::GeneralFailure
                 })?;
             self.file.id = res.file_id.clone();
-            self.upload_state.upload_id = res.upload_id.clone();
+            let Some(upload_id) = res.upload_id else {
+                error!("create file with proof failed: missing upload_id");
+                return Err(FsError::GeneralFailure);
+            };
+            self.upload_state.upload_id = upload_id;
             let upload_urls: Vec<_> = res
                 .part_info_list
                 .into_iter()
@@ -642,31 +749,39 @@ impl AliyunDavFile {
                 self.upload_state.chunk_count
             );
             let mut upload_url = &self.upload_state.upload_urls[current_chunk as usize - 1];
-            if is_url_expired(upload_url) {
-                if let Ok(part_info_list) = self
-                    .fs
-                    .drive
-                    .get_upload_url(
-                        &self.file.id,
-                        &self.upload_state.upload_id,
-                        self.upload_state.chunk_count,
-                    )
-                    .await
-                {
-                    let upload_urls: Vec<_> =
-                        part_info_list.into_iter().map(|x| x.upload_url).collect();
-                    self.upload_state.upload_urls = upload_urls;
-                    upload_url = &self.upload_state.upload_urls[current_chunk as usize - 1];
+            let upload_data = chunk_data.freeze();
+            let mut res = self.fs.drive.upload(upload_url, upload_data.clone()).await;
+            if let Err(ref err) = res {
+                if err.to_string().contains("expired") {
+                    warn!(
+                        file_id = %self.file.id,
+                        file_name = %self.file.name,
+                        upload_url = %upload_url,
+                        "upload url expired"
+                    );
+                    if let Ok(part_info_list) = self
+                        .fs
+                        .drive
+                        .get_upload_url(
+                            &self.file.id,
+                            &self.upload_state.upload_id,
+                            self.upload_state.chunk_count,
+                        )
+                        .await
+                    {
+                        let upload_urls: Vec<_> =
+                            part_info_list.into_iter().map(|x| x.upload_url).collect();
+                        self.upload_state.upload_urls = upload_urls;
+                        upload_url = &self.upload_state.upload_urls[current_chunk as usize - 1];
+                        // retry upload
+                        res = self.fs.drive.upload(upload_url, upload_data).await;
+                    }
                 }
-            }
-            self.fs
-                .drive
-                .upload(upload_url, chunk_data.freeze())
-                .await
-                .map_err(|err| {
+                res.map_err(|err| {
                     error!(
                         file_id = %self.file.id,
                         file_name = %self.file.name,
+                        upload_url = %upload_url,
                         size = self.upload_state.size,
                         error = %err,
                         "upload file chunk {} failed",
@@ -674,6 +789,7 @@ impl AliyunDavFile {
                     );
                     FsError::GeneralFailure
                 })?;
+            }
             self.upload_state.chunk += 1;
         }
         Ok(())
@@ -707,6 +823,35 @@ impl DavFile for AliyunDavFile {
         .boxed()
     }
 
+    fn redirect_url(&mut self) -> FsFuture<Option<String>> {
+        debug!(file_id = %self.file.id, file_name = %self.file.name, "file: redirect_url");
+        async move {
+            if self.file.id.is_empty() {
+                return Err(FsError::NotFound);
+            }
+            let download_url = self.file.url.take();
+            let download_url = if let Some(mut url) = download_url {
+                if is_url_expired(&url) {
+                    debug!(url = %url, "download url expired");
+                    url = self.get_download_url().await?.url;
+                }
+                url
+            } else {
+                let res = self.get_download_url().await?;
+                res.url
+            };
+
+            if !download_url.is_empty() {
+                self.file.url = Some(download_url.clone());
+                if !download_url.contains("x-oss-additional-headers=referer") {
+                    return Ok(Some(download_url));
+                }
+            }
+            Ok(None)
+        }
+        .boxed()
+    }
+
     fn write_buf(&'_ mut self, buf: Box<dyn Buf + Send>) -> FsFuture<'_, ()> {
         debug!(file_id = %self.file.id, file_name = %self.file.name, "file: write_buf");
         async move {
@@ -720,7 +865,7 @@ impl DavFile for AliyunDavFile {
     }
 
     fn write_bytes(&mut self, buf: Bytes) -> FsFuture<()> {
-        debug!(file_id = %self.file.id, file_name = %self.file.name, "file: write_bytes");
+        debug!(file_id = %self.file.id, file_name = %self.file.name, size = buf.len(), "file: write_bytes");
         async move {
             if self.prepare_for_upload().await? {
                 self.upload_state.buffer.extend_from_slice(&buf);
@@ -758,10 +903,16 @@ impl DavFile for AliyunDavFile {
             };
 
             if !download_url.is_empty() {
+                let mut url =
+                    reqwest::Url::parse(&download_url).map_err(|_| FsError::GeneralFailure)?;
+                if self.http_download {
+                    url.set_scheme("http")
+                        .map_err(|_| FsError::GeneralFailure)?;
+                }
                 let content = self
                     .fs
                     .drive
-                    .download(&download_url, Some((self.current_pos, count)))
+                    .download(url, Some((self.current_pos, count)))
                     .await
                     .map_err(|err| {
                         error!(url = %download_url, error = %err, "download file failed");
@@ -810,7 +961,7 @@ impl DavFile for AliyunDavFile {
         async move {
             let new_pos = match pos {
                 SeekFrom::Start(pos) => pos,
-                SeekFrom::End(pos) => (self.file.size as i64 - pos) as u64,
+                SeekFrom::End(pos) => (self.file.size as i64 + pos) as u64,
                 SeekFrom::Current(size) => self.current_pos + size as u64,
             };
             self.current_pos = new_pos;
@@ -841,7 +992,7 @@ impl DavFile for AliyunDavFile {
                 }
                 self.fs
                     .remove_uploading_file(&self.parent_file_id, &self.file.name);
-                self.fs.dir_cache.invalidate_all();
+                self.fs.dir_cache.invalidate(&self.parent_dir).await;
             }
             Ok(())
         }
@@ -864,8 +1015,8 @@ fn is_url_expired(url: &str) -> bool {
                 .duration_since(UNIX_EPOCH)
                 .expect("Time went backwards")
                 .as_secs();
-            // 预留 1s
-            return current_ts >= expires - 1;
+            // 预留 1 分钟
+            return current_ts >= expires - 60;
         }
     }
     false

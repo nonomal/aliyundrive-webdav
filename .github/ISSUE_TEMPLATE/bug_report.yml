@@ -15,7 +15,7 @@ body:
     id: description
     attributes:
       label: 问题描述
-      description: 请提供问题的简要描述
+      description: 请提供问题的简要描述和你已经尝试过的解决方案
       placeholder: The bug is...
     validations:
       required: true
@@ -23,7 +23,7 @@ body:
     id: reproduce
     attributes:
       label: 重现步骤
-      description: 请提供重现该问题的详细步骤
+      description: 请提供重现该问题的详细步骤, 否则直接关闭 issue.
       placeholder: |
         1.
         2.
@@ -42,13 +42,7 @@ body:
     attributes:
       label: 运行平台
       placeholder: 什么路由器/盒子？Docker？Windows/Linux/macOS？
-    validations:
-      required: true
-  - type: input
-    id: refresh-token
-    attributes:
-      label: refresh token 获取方式
-      placeholder: 网页版/App
+      description: 提示:Docker 请先确认是从官方镜像源安装
     validations:
       required: true
   - type: textarea

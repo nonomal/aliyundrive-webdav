@@ -11,9 +11,13 @@ pub struct RefreshTokenResponse {
     pub refresh_token: String,
     pub expires_in: u64,
     pub token_type: String,
-    pub user_id: String,
-    pub nick_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetDriveInfoResponse {
     pub default_drive_id: String,
+    pub resource_drive_id: Option<String>,
+    pub backup_drive_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -21,10 +25,6 @@ pub struct ListFileRequest<'a> {
     pub drive_id: &'a str,
     pub parent_file_id: &'a str,
     pub limit: u64,
-    pub all: bool,
-    pub image_thumbnail_process: &'a str,
-    pub image_url_process: &'a str,
-    pub video_thumbnail_process: &'a str,
     pub fields: &'a str,
     pub order_by: &'a str,
     pub order_direction: &'a str,
@@ -46,9 +46,9 @@ pub struct ListFileItem {
     pub r#type: FileType,
     pub created_at: DateTime,
     pub updated_at: DateTime,
-    #[serde(default)]
-    pub size: u64,
+    pub size: Option<u64>,
     pub url: Option<String>,
+    pub content_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -112,6 +112,7 @@ impl From<GetFileResponse> for AliyunFile {
             updated_at: res.updated_at,
             size,
             url: None,
+            content_hash: None,
         }
     }
 }
@@ -120,6 +121,7 @@ impl From<GetFileResponse> for AliyunFile {
 pub struct GetFileDownloadUrlRequest<'a> {
     pub drive_id: &'a str,
     pub file_id: &'a str,
+    pub expire_sec: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,8 +129,8 @@ pub struct GetFileDownloadUrlResponse {
     pub url: String,
     #[serde(default)]
     pub streams_url: HashMap<String, String>,
-    pub size: u64,
     pub expiration: String,
+    pub method: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,7 +156,6 @@ pub struct CreateFolderRequest<'a> {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RenameFileRequest<'a> {
-    pub check_name_mode: &'a str,
     pub drive_id: &'a str,
     pub file_id: &'a str,
     pub name: &'a str,
@@ -164,7 +165,6 @@ pub struct RenameFileRequest<'a> {
 pub struct MoveFileRequest<'a> {
     pub drive_id: &'a str,
     pub file_id: &'a str,
-    pub to_drive_id: &'a str,
     pub to_parent_file_id: &'a str,
     pub new_name: Option<&'a str>,
 }
@@ -174,7 +174,7 @@ pub struct CopyFileRequest<'a> {
     pub drive_id: &'a str,
     pub file_id: &'a str,
     pub to_parent_file_id: &'a str,
-    pub new_name: Option<&'a str>,
+    pub auto_rename: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,7 +204,7 @@ pub struct CreateFileWithProofResponse {
     #[serde(default)]
     pub part_info_list: Vec<UploadPartInfo>,
     pub file_id: String,
-    pub upload_id: String,
+    pub upload_id: Option<String>,
     pub file_name: String,
 }
 
@@ -224,9 +224,14 @@ pub struct GetUploadUrlRequest<'a> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct GetDriveResponse {
+pub struct SpaceInfo {
     pub total_size: u64,
     pub used_size: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetSpaceInfoResponse {
+    pub personal_space_info: SpaceInfo,
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +277,7 @@ pub struct AliyunFile {
     #[serde(default)]
     pub size: u64,
     pub url: Option<String>,
+    pub content_hash: Option<String>,
 }
 
 impl AliyunFile {
@@ -285,6 +291,7 @@ impl AliyunFile {
             updated_at: DateTime(now),
             size: 0,
             url: None,
+            content_hash: None,
         }
     }
 }
@@ -297,13 +304,14 @@ impl From<ListFileItem> for AliyunFile {
             r#type: f.r#type,
             created_at: f.created_at,
             updated_at: f.updated_at,
-            size: f.size,
+            size: f.size.unwrap_or_default(),
             // 文件列表接口返回的图片下载地址经常是有问题的, 不使用它
             url: if matches!(f.category.as_deref(), Some("image")) {
                 None
             } else {
                 f.url
             },
+            content_hash: f.content_hash,
         }
     }
 }
